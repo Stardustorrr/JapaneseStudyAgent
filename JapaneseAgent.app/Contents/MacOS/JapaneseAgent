@@ -1,0 +1,46 @@
+#!/bin/zsh
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+LOG_DIR="$PROJECT_DIR/logs"
+LOG_FILE="$LOG_DIR/app.log"
+PYTHON="$PROJECT_DIR/.venv/bin/python"
+PIP="$PROJECT_DIR/.venv/bin/pip"
+
+cd "$PROJECT_DIR"
+mkdir -p "$LOG_DIR"
+
+exec >>"$LOG_FILE" 2>&1
+
+fail() {
+  local message="$1"
+  echo "ERROR: $message"
+  /usr/bin/osascript -e "display dialog \"JapaneseAgent 启动失败：$message\n\n详细日志：$LOG_FILE\" buttons {\"OK\"} default button \"OK\" with icon caution" >/dev/null 2>&1
+  exit 1
+}
+
+echo ""
+echo "===== $(date '+%Y-%m-%d %H:%M:%S') JapaneseAgent launch ====="
+echo "Project: $PROJECT_DIR"
+
+if [ ! -d ".venv" ]; then
+  echo "Creating .venv..."
+  python3 -m venv .venv || fail "无法创建 Python 虚拟环境"
+fi
+
+if [ ! -x "$PYTHON" ]; then
+  fail "找不到虚拟环境里的 Python：$PYTHON"
+fi
+
+if [ ! -x "$PIP" ]; then
+  fail "找不到虚拟环境里的 pip：$PIP"
+fi
+
+if ! "$PYTHON" -c "import openai" >/dev/null 2>&1; then
+  echo "Installing dependencies..."
+  "$PIP" install -r requirements.txt || fail "依赖安装失败"
+fi
+
+echo "Starting GUI..."
+"$PYTHON" -m japanese_agent.gui || fail "窗口程序运行失败"
