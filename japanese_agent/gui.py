@@ -9,20 +9,18 @@ from typing import Any
 
 from .app_core import PracticeState, load_practice_state
 from .config import get_default_cn_to_ja_count, get_default_ja_to_cn_count, load_dotenv
-from .grammar_srs import update_grammar_review
+from .exercises import GENERATION_MODE_RANDOM, GENERATION_MODE_REVIEW
+from .grammar_srs import load_grammar_srs, parse_date, update_grammar_review
+from .notes import load_entries
 from .openai_client import exercise_to_dict, fallback_grade
 from .session import save_session
-
-
-DEFAULT_CN_TO_JA_COUNT = get_default_cn_to_ja_count()
-DEFAULT_JA_TO_CN_COUNT = get_default_ja_to_cn_count()
 
 
 class JapaneseAgentApp(tk.Tk):
     def __init__(
         self,
-        cn_to_ja_count: int = DEFAULT_CN_TO_JA_COUNT,
-        ja_to_cn_count: int = DEFAULT_JA_TO_CN_COUNT,
+        cn_to_ja_count: int | None = None,
+        ja_to_cn_count: int | None = None,
         regenerate: bool = False,
     ) -> None:
         super().__init__()
@@ -32,13 +30,14 @@ class JapaneseAgentApp(tk.Tk):
 
         self.state_data: PracticeState | None = None
         self.current_index = 0
-        self.cn_to_ja_count = cn_to_ja_count
-        self.ja_to_cn_count = ja_to_cn_count
+        self.cn_to_ja_count = cn_to_ja_count if cn_to_ja_count is not None else get_default_cn_to_ja_count()
+        self.ja_to_cn_count = ja_to_cn_count if ja_to_cn_count is not None else get_default_ja_to_cn_count()
+        self.generation_mode = GENERATION_MODE_REVIEW
         self.loading = False
 
         self._build_styles()
         self._build_layout()
-        self.load_session(regenerate=regenerate, async_load=False)
+        self.after(0, lambda: self.ask_generation_mode(regenerate=True))
 
     def _build_styles(self) -> None:
         style = ttk.Style(self)
@@ -72,7 +71,7 @@ class JapaneseAgentApp(tk.Tk):
         sidebar.rowconfigure(2, weight=1)
 
         ttk.Label(sidebar, text="今日题目", font=("Helvetica", 14, "bold")).grid(row=0, column=0, sticky="w")
-        self.progress_var = tk.StringVar(value="")
+        self.progress_var = tk.StringVar(value="请选择生成模式")
         ttk.Label(sidebar, textvariable=self.progress_var).grid(row=1, column=0, sticky="w", pady=(4, 10))
 
         self.exercise_list = tk.Listbox(sidebar, width=26, height=18, activestyle="none", exportselection=False)
@@ -88,13 +87,19 @@ class JapaneseAgentApp(tk.Tk):
         count_frame.columnconfigure(3, weight=1)
         ttk.Label(count_frame, text="中译日").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.cn_to_ja_var = tk.IntVar(value=self.cn_to_ja_count)
-        ttk.Spinbox(count_frame, from_=0, to=20, width=4, textvariable=self.cn_to_ja_var).grid(row=0, column=1, sticky="ew")
+        self.cn_to_ja_spinbox = ttk.Spinbox(count_frame, from_=0, to=20, width=4, textvariable=self.cn_to_ja_var)
+        self.cn_to_ja_spinbox.grid(row=0, column=1, sticky="ew")
         ttk.Label(count_frame, text="日译中").grid(row=0, column=2, sticky="w", padx=(8, 4))
         self.ja_to_cn_var = tk.IntVar(value=self.ja_to_cn_count)
-        ttk.Spinbox(count_frame, from_=0, to=20, width=4, textvariable=self.ja_to_cn_var).grid(row=0, column=3, sticky="ew")
+        self.ja_to_cn_spinbox = ttk.Spinbox(count_frame, from_=0, to=20, width=4, textvariable=self.ja_to_cn_var)
+        self.ja_to_cn_spinbox.grid(row=0, column=3, sticky="ew")
 
         self.regenerate_button = ttk.Button(sidebar_buttons, text="按数量重新生成", command=self.regenerate_session)
         self.regenerate_button.grid(row=1, column=0, sticky="ew")
+        self.grammar_status_button = ttk.Button(sidebar_buttons, text="语法复习状态", command=self.show_grammar_status)
+        self.grammar_status_button.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.change_mode_button = ttk.Button(sidebar_buttons, text="更换生成模式", command=self.ask_generation_mode)
+        self.change_mode_button.grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
         main_panel = ttk.Frame(self, style="Panel.TFrame", padding=(22, 20))
         main_panel.grid(row=1, column=1, sticky="nsew", padx=(0, 18), pady=(0, 18))
@@ -137,6 +142,79 @@ class JapaneseAgentApp(tk.Tk):
         self.result_text = scrolledtext.ScrolledText(main_panel, height=9, wrap="word", font=("Helvetica", 13))
         self.result_text.grid(row=6, column=0, sticky="nsew", pady=(6, 0))
         self.result_text.configure(state="disabled")
+        self.set_controls_enabled(False)
+
+    def ask_generation_mode(self, regenerate: bool = True) -> None:
+        if self.loading:
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("选择生成模式")
+        dialog.geometry("460x300")
+        dialog.minsize(420, 280)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        container = ttk.Frame(dialog, padding=(22, 18))
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+
+        ttk.Label(container, text="今天如何生成题目？", font=("Helvetica", 16, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            container,
+            text="复习模式会自动覆盖所有未复习或今日到期的语法；随机模式使用你指定的题目数量。",
+            wraplength=400,
+        ).grid(row=1, column=0, sticky="ew", pady=(8, 16))
+
+        def choose_review() -> None:
+            self.generation_mode = GENERATION_MODE_REVIEW
+            dialog.destroy()
+            self.update_generation_mode_controls()
+            self.load_session(regenerate=regenerate)
+
+        ttk.Button(container, text="按语法复习情况生成", style="Accent.TButton", command=choose_review).grid(
+            row=2, column=0, sticky="ew"
+        )
+
+        random_frame = ttk.Frame(container)
+        random_frame.grid(row=3, column=0, sticky="ew", pady=(18, 0))
+        random_frame.columnconfigure(1, weight=1)
+        random_frame.columnconfigure(3, weight=1)
+        ttk.Label(random_frame, text="随机抽选语法", font=("Helvetica", 12, "bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 8)
+        )
+        random_cn_var = tk.IntVar(value=self.cn_to_ja_count)
+        random_ja_var = tk.IntVar(value=self.ja_to_cn_count)
+        ttk.Label(random_frame, text="中译日").grid(row=1, column=0, sticky="w", padx=(0, 4))
+        ttk.Spinbox(random_frame, from_=0, to=20, width=4, textvariable=random_cn_var).grid(row=1, column=1, sticky="ew")
+        ttk.Label(random_frame, text="日译中").grid(row=1, column=2, sticky="w", padx=(10, 4))
+        ttk.Spinbox(random_frame, from_=0, to=20, width=4, textvariable=random_ja_var).grid(row=1, column=3, sticky="ew")
+
+        def choose_random() -> None:
+            self.generation_mode = GENERATION_MODE_RANDOM
+            self.cn_to_ja_count = max(0, int(random_cn_var.get()))
+            self.ja_to_cn_count = max(0, int(random_ja_var.get()))
+            self.cn_to_ja_var.set(self.cn_to_ja_count)
+            self.ja_to_cn_var.set(self.ja_to_cn_count)
+            dialog.destroy()
+            self.update_generation_mode_controls()
+            self.load_session(regenerate=regenerate)
+
+        ttk.Button(container, text="按指定数量随机生成", command=choose_random).grid(row=4, column=0, sticky="ew", pady=(14, 0))
+
+        self.wait_window(dialog)
+
+    def update_generation_mode_controls(self) -> None:
+        is_random = self.generation_mode == GENERATION_MODE_RANDOM
+        mode_label = "随机抽选语法" if is_random else "按语法复习情况"
+        button_label = "按数量重新生成" if is_random else "按复习状态重新生成"
+        spinbox_state = "normal" if is_random else "disabled"
+        self.regenerate_button.configure(text=button_label)
+        self.cn_to_ja_spinbox.configure(state=spinbox_state)
+        self.ja_to_cn_spinbox.configure(state=spinbox_state)
+        if not self.state_data:
+            self.progress_var.set(mode_label)
 
     def load_session(self, regenerate: bool = False, async_load: bool = True) -> None:
         if self.loading:
@@ -174,6 +252,7 @@ class JapaneseAgentApp(tk.Tk):
             cn_to_ja_count=self.cn_to_ja_count,
             ja_to_cn_count=self.ja_to_cn_count,
             regenerate=regenerate,
+            generation_mode=self.generation_mode,
         )
 
     def finish_loading(self, state: PracticeState) -> None:
@@ -193,7 +272,10 @@ class JapaneseAgentApp(tk.Tk):
         self.refresh_exercise_list()
         self.show_current_exercise()
         mode = "AI 批改" if self.state_data.tutor else "本地占位批改"
-        self.status_var.set(f"{self.state_data.date} · {mode} · {self.state_data.vocabulary_status}")
+        generation_mode = generation_mode_label(self.state_data.generation_mode)
+        self.generation_mode = self.state_data.generation_mode
+        self.update_generation_mode_controls()
+        self.status_var.set(f"{self.state_data.date} · {generation_mode} · {mode} · {self.state_data.vocabulary_status}")
 
     def set_loading_state(self, message: str) -> None:
         self.status_var.set(message)
@@ -203,15 +285,145 @@ class JapaneseAgentApp(tk.Tk):
     def set_controls_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
         self.regenerate_button.configure(state=state)
+        self.grammar_status_button.configure(state=state)
+        self.change_mode_button.configure(state=state)
         self.submit_button.configure(state=state)
 
     def regenerate_session(self) -> None:
         confirmed = messagebox.askyesno(
             "重新生成",
-            "这会用最新笔记重新生成今天的题目。仍然匹配新题目的作答记录会被保留，已经写入的复习状态不会撤销。继续吗？",
+            "这会用当前模式和最新笔记重新生成今天的题目。仍然匹配新题目的作答记录会被保留，已经写入的复习状态不会撤销。继续吗？",
         )
         if confirmed:
             self.load_session(regenerate=True)
+
+    def show_grammar_status(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("语法复习状态")
+        window.geometry("960x560")
+        window.minsize(820, 420)
+
+        container = ttk.Frame(window, padding=(14, 12))
+        container.pack(fill="both", expand=True)
+        container.rowconfigure(1, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        summary_var = tk.StringVar(value="")
+        ttk.Label(container, textvariable=summary_var, font=("Helvetica", 13, "bold")).grid(row=0, column=0, sticky="w")
+
+        columns = ("title", "status", "due", "interval", "reps", "lapses", "last_score", "last_reviewed")
+        tree = ttk.Treeview(container, columns=columns, show="headings", height=18)
+        headings = {
+            "title": "语法",
+            "status": "状态",
+            "due": "到期日",
+            "interval": "间隔",
+            "reps": "次数",
+            "lapses": "遗忘",
+            "last_score": "最近分数",
+            "last_reviewed": "最近复习",
+        }
+        widths = {
+            "title": 310,
+            "status": 90,
+            "due": 110,
+            "interval": 70,
+            "reps": 60,
+            "lapses": 60,
+            "last_score": 80,
+            "last_reviewed": 110,
+        }
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], anchor="w")
+        tree.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns", pady=(10, 0))
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        rows = self.build_grammar_status_rows()
+        today = date.today()
+        reviewed_count = 0
+        due_count = 0
+        for row in rows:
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    row["title"],
+                    row["status"],
+                    row["due"],
+                    row["interval"],
+                    row["reps"],
+                    row["lapses"],
+                    row["last_score"],
+                    row["last_reviewed"],
+                ),
+            )
+            if row["reviewed"]:
+                reviewed_count += 1
+            if row["due_sort"] <= today:
+                due_count += 1
+        summary_var.set(f"共 {len(rows)} 个语法，已复习 {reviewed_count} 个，当前到期 {due_count} 个")
+
+        button_row = ttk.Frame(container)
+        button_row.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(button_row, text="关闭", command=window.destroy).pack(side="right")
+
+    def build_grammar_status_rows(self) -> list[dict[str, Any]]:
+        states = load_grammar_srs()
+        titles = set(states)
+        if self.state_data:
+            try:
+                titles.update(entry.title for entry in load_entries(self.state_data.notes_dir))
+            except Exception:
+                pass
+
+        today = date.today()
+        rows: list[dict[str, Any]] = []
+        for title in sorted(titles):
+            state = states.get(title)
+            if state is None:
+                rows.append(
+                    {
+                        "title": title,
+                        "status": "未复习",
+                        "due": "-",
+                        "interval": "-",
+                        "reps": "0",
+                        "lapses": "0",
+                        "last_score": "-",
+                        "last_reviewed": "-",
+                        "reviewed": False,
+                        "due_sort": today,
+                    }
+                )
+                continue
+
+            due_date = parse_date(state.due) if state.due else today
+            if due_date <= today:
+                status = "到期"
+            elif state.last_score is not None and state.last_score < 80:
+                status = "需巩固"
+            else:
+                status = "进行中"
+            rows.append(
+                {
+                    "title": title,
+                    "status": status,
+                    "due": state.due or "-",
+                    "interval": f"{state.interval_days}天" if state.interval_days else "-",
+                    "reps": str(state.reps),
+                    "lapses": str(state.lapses),
+                    "last_score": "-" if state.last_score is None else str(state.last_score),
+                    "last_reviewed": state.last_reviewed or "-",
+                    "reviewed": True,
+                    "due_sort": due_date,
+                }
+            )
+
+        return sorted(rows, key=lambda row: (row["due_sort"], row["status"] == "未复习", row["title"]))
 
     def first_unanswered_index(self) -> int:
         if not self.state_data:
@@ -346,7 +558,7 @@ class JapaneseAgentApp(tk.Tk):
         self.submit_button.configure(state="normal")
         self.submit_button.configure(text="更改答案")
         mode = "AI 批改" if self.state_data.tutor else "本地占位批改"
-        self.status_var.set(f"{self.state_data.date} · {mode} · 已保存")
+        self.status_var.set(f"{self.state_data.date} · {generation_mode_label(self.state_data.generation_mode)} · {mode} · 已保存")
 
     def fail_grading(self, message: str) -> None:
         self.submit_button.configure(state="normal")
@@ -422,11 +634,19 @@ def label_for_type(exercise_type: str) -> str:
     return exercise_type
 
 
+def generation_mode_label(mode: str) -> str:
+    if mode == GENERATION_MODE_REVIEW:
+        return "按语法复习情况"
+    if mode == GENERATION_MODE_RANDOM:
+        return "随机抽选语法"
+    return mode
+
+
 def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description="JapaneseAgent desktop app.")
-    parser.add_argument("--cn-to-ja-count", type=int, default=DEFAULT_CN_TO_JA_COUNT)
-    parser.add_argument("--ja-to-cn-count", type=int, default=DEFAULT_JA_TO_CN_COUNT)
+    parser.add_argument("--cn-to-ja-count", type=int, default=None)
+    parser.add_argument("--ja-to-cn-count", type=int, default=None)
     parser.add_argument("--regenerate", action="store_true")
     args = parser.parse_args()
 

@@ -67,6 +67,19 @@ def save_grammar_srs(states: dict[str, GrammarReviewState]) -> Path:
     return SRS_PATH
 
 
+def mark_grammar_due(titles: list[str], due_date: str | None = None) -> None:
+    if not titles:
+        return
+
+    today = parse_date(due_date).isoformat() if due_date else date.today().isoformat()
+    states = load_grammar_srs()
+    for title in titles:
+        state = states.get(title, GrammarReviewState(title=title))
+        state.due = today
+        states[title] = state
+    save_grammar_srs(states)
+
+
 def update_grammar_review(title: str, score: int, review_date: str | None = None) -> GrammarReviewState:
     today = parse_date(review_date) if review_date else date.today()
     states = load_grammar_srs()

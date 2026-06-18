@@ -7,7 +7,7 @@ from typing import Any
 
 from .anki import VocabularyEntry, load_anki_vocabulary
 from .config import get_model, get_notes_dir
-from .exercises import ExerciseSet, build_exercise_set
+from .exercises import GENERATION_MODE_RANDOM, ExerciseSet, build_exercise_set, normalize_generation_mode
 from .grammar_srs import load_grammar_srs
 from .notes import load_entries
 from .openai_client import JapaneseTutorClient
@@ -29,6 +29,7 @@ class PracticeState:
     used_existing: bool
     vocabulary: list[VocabularyEntry]
     vocabulary_status: str
+    generation_mode: str
 
 
 def build_tutor(model: str | None = None) -> JapaneseTutorClient | None:
@@ -50,7 +51,9 @@ def load_practice_state(
     cn_to_ja_count: int = 3,
     ja_to_cn_count: int = 2,
     regenerate: bool = False,
+    generation_mode: str = GENERATION_MODE_RANDOM,
 ) -> PracticeState:
+    mode = normalize_generation_mode(generation_mode)
     notes_dir = get_notes_dir(notes_dir_value)
     entries = load_entries(notes_dir)
     if not entries:
@@ -65,7 +68,8 @@ def load_practice_state(
     )
     recent_grammar_titles = load_recent_grammar_titles(date_value)
     grammar_states = load_grammar_srs()
-    should_regenerate = regenerate or bool(existing and has_legacy_exercises(existing))
+    existing_mode = existing_exercise_set.generation_mode if existing_exercise_set else ""
+    should_regenerate = regenerate or bool(existing and (has_legacy_exercises(existing) or existing_mode != mode))
 
     if existing and not should_regenerate:
         exercise_set = ExerciseSet.from_dict(existing["exercise_set"])
@@ -83,6 +87,7 @@ def load_practice_state(
                 ja_to_cn_count=ja_to_cn_count,
                 recent_grammar_titles=recent_grammar_titles,
                 grammar_states=grammar_states,
+                generation_mode=mode,
             )
         except Exception as error:
             if not tutor:
@@ -97,6 +102,7 @@ def load_practice_state(
                 ja_to_cn_count=ja_to_cn_count,
                 recent_grammar_titles=recent_grammar_titles,
                 grammar_states=grammar_states,
+                generation_mode=mode,
             )
         answers = carry_over_answers(existing_answers, exercise_set)
         save_session(date_value, exercise_set, answers)
@@ -113,6 +119,7 @@ def load_practice_state(
         used_existing=used_existing,
         vocabulary=vocabulary,
         vocabulary_status=vocabulary_status,
+        generation_mode=exercise_set.generation_mode,
     )
 
 

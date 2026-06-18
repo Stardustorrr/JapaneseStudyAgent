@@ -17,6 +17,7 @@ DEFAULT_ANKI_MEANING_FIELDS = ("Meaning", "Back", "中文", "Chinese")
 DEFAULT_CN_TO_JA_COUNT = 3
 DEFAULT_JA_TO_CN_COUNT = 2
 DEFAULT_MAX_GRAMMAR_PER_EXERCISE = 3
+DEFAULT_REVIEW_MODE_EXERCISE_LIMIT = 12
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -94,3 +95,11 @@ def get_default_ja_to_cn_count() -> int:
 
 def get_max_grammar_per_exercise() -> int:
     return get_int_env("JAPANESE_AGENT_MAX_GRAMMAR_PER_EXERCISE", DEFAULT_MAX_GRAMMAR_PER_EXERCISE, minimum=1)
+
+
+def get_review_mode_exercise_limit() -> int:
+    return get_int_env(
+        "JAPANESE_AGENT_REVIEW_MODE_EXERCISE_LIMIT",
+        DEFAULT_REVIEW_MODE_EXERCISE_LIMIT,
+        minimum=0,
+    )

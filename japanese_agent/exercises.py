@@ -6,9 +6,15 @@ import random
 from typing import Any
 
 from .anki import VocabularyEntry
-from .config import get_max_grammar_per_exercise
-from .grammar_srs import GrammarReviewState, grammar_weight, parse_date
+from .config import get_max_grammar_per_exercise, get_review_mode_exercise_limit
+from .grammar_srs import GrammarReviewState, grammar_weight, mark_grammar_due, parse_date
 from .notes import GrammarEntry
+
+
+GENERATION_MODE_REVIEW = "review"
+GENERATION_MODE_RANDOM = "random"
+GENERATION_MODES = {GENERATION_MODE_REVIEW, GENERATION_MODE_RANDOM}
+AI_EXERCISE_BATCH_SIZE = 8
 
 
 @dataclass
@@ -31,12 +37,14 @@ class ExerciseSet:
     notes_used: list[str]
     exercises: list[Exercise]
     vocabulary_used: list[str] | None = None
+    generation_mode: str = GENERATION_MODE_RANDOM
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "date": self.date,
             "notes_used": self.notes_used,
             "vocabulary_used": self.vocabulary_used or [],
+            "generation_mode": self.generation_mode,
             "exercises": [asdict(exercise) for exercise in self.exercises],
         }
 
@@ -46,6 +54,7 @@ class ExerciseSet:
             date=payload["date"],
             notes_used=list(payload.get("notes_used", [])),
             vocabulary_used=list(payload.get("vocabulary_used", [])),
+            generation_mode=normalize_generation_mode(payload.get("generation_mode")),
             exercises=[Exercise(**normalize_exercise_payload(item)) for item in payload.get("exercises", [])],
         )
 
@@ -87,31 +96,113 @@ def build_exercise_set(
     ja_to_cn_count: int,
     recent_grammar_titles: set[str] | None = None,
     grammar_states: dict[str, GrammarReviewState] | None = None,
+    generation_mode: str = GENERATION_MODE_RANDOM,
 ) -> ExerciseSet:
-    cn_groups = build_grammar_groups(
-        entries,
-        f"{date}:cn_to_ja",
-        recent_grammar_titles or set(),
-        cn_to_ja_count,
-        grammar_states or {},
-        get_max_grammar_per_exercise(),
-    )
-    used_titles = {entry.title for group in cn_groups for entry in group}
-    remaining_entries = [entry for entry in entries if entry.title not in used_titles]
-    ja_groups = build_grammar_groups(
-        remaining_entries or entries,
-        f"{date}:ja_to_cn",
-        recent_grammar_titles or set(),
-        ja_to_cn_count,
-        grammar_states or {},
-        get_max_grammar_per_exercise(),
-    )
+    mode = normalize_generation_mode(generation_mode)
+    if mode == GENERATION_MODE_REVIEW:
+        cn_groups, ja_groups = build_review_mode_groups(
+            entries,
+            date,
+            grammar_states or {},
+            get_max_grammar_per_exercise(),
+            get_review_mode_exercise_limit(),
+        )
+        cn_to_ja_count = len(cn_groups)
+        ja_to_cn_count = len(ja_groups)
+    else:
+        cn_groups = build_grammar_groups(
+            entries,
+            f"{date}:cn_to_ja",
+            recent_grammar_titles or set(),
+            cn_to_ja_count,
+            grammar_states or {},
+            get_max_grammar_per_exercise(),
+            weighted=False,
+        )
+        used_titles = {entry.title for group in cn_groups for entry in group}
+        remaining_entries = [entry for entry in entries if entry.title not in used_titles]
+        ja_groups = build_grammar_groups(
+            remaining_entries or entries,
+            f"{date}:ja_to_cn",
+            recent_grammar_titles or set(),
+            ja_to_cn_count,
+            grammar_states or {},
+            get_max_grammar_per_exercise(),
+            weighted=False,
+        )
     grammar_groups = [*cn_groups, *ja_groups]
     selected = [entry for group in grammar_groups for entry in group]
     if tutor:
-        return tutor.generate_exercises(date, selected, vocabulary, cn_to_ja_count, ja_to_cn_count, grammar_groups)
+        exercise_set = generate_with_batches(
+            tutor,
+            date,
+            vocabulary,
+            cn_groups,
+            ja_groups,
+            mode,
+        )
+        exercise_set.generation_mode = mode
+        return exercise_set
 
-    return build_fallback_exercises(date, selected, vocabulary, cn_to_ja_count, ja_to_cn_count, grammar_groups)
+    return build_fallback_exercises(date, selected, vocabulary, cn_to_ja_count, ja_to_cn_count, grammar_groups, mode)
+
+
+def generate_with_batches(
+    tutor: Any,
+    date: str,
+    vocabulary: list[VocabularyEntry],
+    cn_groups: list[list[GrammarEntry]],
+    ja_groups: list[list[GrammarEntry]],
+    generation_mode: str,
+) -> ExerciseSet:
+    if len(cn_groups) + len(ja_groups) <= AI_EXERCISE_BATCH_SIZE:
+        selected = [entry for group in [*cn_groups, *ja_groups] for entry in group]
+        return tutor.generate_exercises(date, selected, vocabulary, len(cn_groups), len(ja_groups), [*cn_groups, *ja_groups])
+
+    batches: list[ExerciseSet] = []
+    for group_batch in chunked(cn_groups, AI_EXERCISE_BATCH_SIZE):
+        selected = [entry for group in group_batch for entry in group]
+        batches.append(tutor.generate_exercises(date, selected, vocabulary, len(group_batch), 0, group_batch))
+    for group_batch in chunked(ja_groups, AI_EXERCISE_BATCH_SIZE):
+        selected = [entry for group in group_batch for entry in group]
+        batches.append(tutor.generate_exercises(date, selected, vocabulary, 0, len(group_batch), group_batch))
+
+    exercises: list[Exercise] = []
+    notes_used: list[str] = []
+    vocabulary_used: list[str] = []
+    for batch in batches:
+        for title in batch.notes_used:
+            if title not in notes_used:
+                notes_used.append(title)
+        for word in batch.vocabulary_used or []:
+            if word not in vocabulary_used:
+                vocabulary_used.append(word)
+        exercises.extend(batch.exercises)
+
+    renumber_exercises(exercises)
+    return ExerciseSet(
+        date=date,
+        notes_used=notes_used,
+        vocabulary_used=vocabulary_used,
+        exercises=exercises,
+        generation_mode=generation_mode,
+    )
+
+
+def chunked(values: list[list[GrammarEntry]], size: int) -> list[list[list[GrammarEntry]]]:
+    return [values[index : index + size] for index in range(0, len(values), max(1, size))]
+
+
+def renumber_exercises(exercises: list[Exercise]) -> None:
+    cn_index = 1
+    ja_index = 1
+    for exercise in exercises:
+        if exercise.type == "translation_cn_to_ja":
+            exercise.id = f"CJ{cn_index}"
+            cn_index += 1
+        elif exercise.type == "translation_ja_to_cn":
+            exercise.id = f"JC{ja_index}"
+            ja_index += 1
 
 
 def build_grammar_groups(
@@ -121,18 +212,22 @@ def build_grammar_groups(
     exercise_count: int,
     grammar_states: dict[str, GrammarReviewState],
     max_per_exercise: int,
+    weighted: bool = True,
 ) -> list[list[GrammarEntry]]:
     if exercise_count <= 0:
         return []
 
     group_sizes = difficulty_group_sizes(exercise_count, max_per_exercise)
-    selected = select_daily_entries_avoiding(
-        entries,
-        date,
-        recent_titles,
-        limit=sum(group_sizes),
-        grammar_states=grammar_states,
-    )
+    if weighted:
+        selected = select_daily_entries_avoiding(
+            entries,
+            date,
+            recent_titles,
+            limit=sum(group_sizes),
+            grammar_states=grammar_states,
+        )
+    else:
+        selected = select_random_entries(entries, date, sum(group_sizes))
     groups: list[list[GrammarEntry]] = []
     cursor = 0
     for size in group_sizes:
@@ -142,6 +237,147 @@ def build_grammar_groups(
         groups.append(group)
         cursor += size
     return groups
+
+
+def build_review_mode_groups(
+    entries: list[GrammarEntry],
+    date: str,
+    grammar_states: dict[str, GrammarReviewState],
+    max_per_exercise: int,
+    exercise_limit: int,
+) -> tuple[list[list[GrammarEntry]], list[list[GrammarEntry]]]:
+    if not entries:
+        return [], []
+
+    today = parse_date(date)
+    target_entries = [
+        entry
+        for entry in entries
+        if entry.title not in grammar_states or parse_date(grammar_states[entry.title].due) <= today
+    ]
+    if not target_entries:
+        target_entries = select_daily_entries_avoiding(
+            entries,
+            f"{date}:review-fill",
+            set(),
+            limit=min(len(entries), max(2, max_per_exercise)),
+            grammar_states=grammar_states,
+        )
+
+    ordered_targets = order_review_targets(target_entries, date, grammar_states)
+    cn_groups, ja_groups, deferred_targets = build_limited_review_groups(
+        ordered_targets,
+        max_per_exercise,
+        exercise_limit,
+    )
+    if deferred_targets:
+        mark_grammar_due([entry.title for entry in deferred_targets], date)
+
+    return cn_groups, ja_groups
+
+
+def build_limited_review_groups(
+    entries: list[GrammarEntry],
+    max_per_exercise: int,
+    exercise_limit: int,
+) -> tuple[list[list[GrammarEntry]], list[list[GrammarEntry]], list[GrammarEntry]]:
+    if not entries:
+        return [], [], []
+    if exercise_limit <= 0:
+        cn_targets, ja_targets = split_targets_by_type(entries)
+        return (
+            pack_entries_with_gradient(cn_targets, max_per_exercise),
+            pack_entries_with_gradient(ja_targets, max_per_exercise),
+            [],
+        )
+
+    cn_exercise_limit = (exercise_limit + 1) // 2
+    ja_exercise_limit = exercise_limit // 2
+    cn_sizes = difficulty_group_sizes(cn_exercise_limit, max_per_exercise) if cn_exercise_limit else []
+    ja_sizes = difficulty_group_sizes(ja_exercise_limit, max_per_exercise) if ja_exercise_limit else []
+    capacity = sum(cn_sizes) + sum(ja_sizes)
+    selected = entries[:capacity]
+    deferred = entries[capacity:]
+
+    if not selected:
+        return [], [], deferred
+
+    midpoint = (len(selected) + 1) // 2 if ja_sizes else len(selected)
+    cn_targets = selected[:midpoint]
+    ja_targets = selected[midpoint:]
+    cn_groups = pack_entries_with_sizes(cn_targets, cn_sizes)
+    ja_groups = pack_entries_with_sizes(ja_targets, ja_sizes)
+    return cn_groups, ja_groups, deferred
+
+
+def pack_entries_with_sizes(entries: list[GrammarEntry], group_sizes: list[int]) -> list[list[GrammarEntry]]:
+    if not entries or not group_sizes:
+        return []
+
+    groups: list[list[GrammarEntry]] = []
+    cursor = 0
+    for size in group_sizes:
+        group = entries[cursor : cursor + size]
+        if group:
+            groups.append(group)
+        cursor += size
+        if cursor >= len(entries):
+            break
+    return groups
+
+
+def order_review_targets(
+    entries: list[GrammarEntry],
+    date: str,
+    grammar_states: dict[str, GrammarReviewState],
+) -> list[GrammarEntry]:
+    today = parse_date(date)
+    rng = random.Random(f"{date}:review-order")
+
+    def priority(entry: GrammarEntry) -> tuple[float, float]:
+        state = grammar_states.get(entry.title)
+        if state is None:
+            return (1000.0, rng.random())
+        due_date = parse_date(state.due)
+        overdue_days = (today - due_date).days
+        low_score = 100 - state.last_score if state.last_score is not None else 0
+        return (overdue_days * 10 + state.lapses * 4 + low_score / 10, rng.random())
+
+    return sorted(entries, key=priority, reverse=True)
+
+
+def split_targets_by_type(entries: list[GrammarEntry]) -> tuple[list[GrammarEntry], list[GrammarEntry]]:
+    midpoint = (len(entries) + 1) // 2
+    return entries[:midpoint], entries[midpoint:]
+
+
+def pack_entries_with_gradient(entries: list[GrammarEntry], max_per_exercise: int) -> list[list[GrammarEntry]]:
+    if not entries:
+        return []
+
+    exercise_count = 1
+    while sum(difficulty_group_sizes(exercise_count, max_per_exercise)) < len(entries):
+        exercise_count += 1
+
+    groups: list[list[GrammarEntry]] = []
+    cursor = 0
+    for size in difficulty_group_sizes(exercise_count, max_per_exercise):
+        group = entries[cursor : cursor + size]
+        if group:
+            groups.append(group)
+        cursor += size
+    if cursor < len(entries):
+        groups.append(entries[cursor:])
+    return groups
+
+
+def select_random_entries(entries: list[GrammarEntry], date: str, limit: int) -> list[GrammarEntry]:
+    if not entries or limit <= 0:
+        return []
+    rng = random.Random(date)
+    shuffled = entries[:]
+    rng.shuffle(shuffled)
+    return shuffled[:limit]
 
 
 def difficulty_group_sizes(exercise_count: int, max_per_exercise: int) -> list[int]:
@@ -164,6 +400,7 @@ def build_fallback_exercises(
     cn_to_ja_count: int,
     ja_to_cn_count: int,
     grammar_groups: list[list[GrammarEntry]] | None = None,
+    generation_mode: str = GENERATION_MODE_RANDOM,
 ) -> ExerciseSet:
     exercises: list[Exercise] = []
     selected_titles = [entry.title for entry in entries]
@@ -223,18 +460,49 @@ def build_fallback_exercises(
         notes_used=selected_titles,
         vocabulary_used=vocabulary_words,
         exercises=exercises[: offset + ja_to_cn_count],
+        generation_mode=generation_mode,
     )
 
 
-def parse_exercise_json(raw: str, date: str, fallback_titles: list[str]) -> ExerciseSet:
+def parse_exercise_json(
+    raw: str,
+    date: str,
+    fallback_titles: list[str],
+    fallback_groups: list[list[GrammarEntry]] | None = None,
+) -> ExerciseSet:
     payload = json.loads(raw)
     exercises = normalize_exercise_sequence(
         [Exercise(**normalize_exercise_payload(item)) for item in payload["exercises"]],
         fallback_titles,
     )
+    if fallback_groups:
+        apply_planned_grammar_groups(exercises, fallback_groups)
     notes_used = payload.get("notes_used") or fallback_titles
+    if fallback_groups:
+        notes_used = [entry.title for group in fallback_groups for entry in group]
     vocabulary_used = list(payload.get("vocabulary_used", []))
-    return ExerciseSet(date=payload.get("date", date), notes_used=notes_used, vocabulary_used=vocabulary_used, exercises=exercises)
+    return ExerciseSet(
+        date=payload.get("date", date),
+        notes_used=notes_used,
+        vocabulary_used=vocabulary_used,
+        exercises=exercises,
+        generation_mode=normalize_generation_mode(payload.get("generation_mode")),
+    )
+
+
+def apply_planned_grammar_groups(exercises: list[Exercise], fallback_groups: list[list[GrammarEntry]]) -> None:
+    for exercise, group in zip(exercises, fallback_groups):
+        grammar_titles = [entry.title for entry in group]
+        if not grammar_titles:
+            continue
+        exercise.grammar_focuses = grammar_titles
+        exercise.grammar_focus = format_grammar_focus(grammar_titles)
+        exercise.difficulty = len(grammar_titles)
+
+
+def normalize_generation_mode(value: Any) -> str:
+    mode = str(value or GENERATION_MODE_RANDOM)
+    return mode if mode in GENERATION_MODES else GENERATION_MODE_RANDOM
 
 
 def build_hint(entries: GrammarEntry | list[GrammarEntry], vocabulary: list[str]) -> str:

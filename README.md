@@ -94,6 +94,7 @@ JAPANESE_AGENT_NOTES_DIR=/path/to/notes
 JAPANESE_AGENT_CN_TO_JA_COUNT=3
 JAPANESE_AGENT_JA_TO_CN_COUNT=2
 JAPANESE_AGENT_MAX_GRAMMAR_PER_EXERCISE=3
+JAPANESE_AGENT_REVIEW_MODE_EXERCISE_LIMIT=12
 ```
 
 练习记录会保存在 `data/sessions/`，方便之后继续做复习和错题统计。
@@ -101,6 +102,11 @@ JAPANESE_AGENT_MAX_GRAMMAR_PER_EXERCISE=3
 窗口版左侧也可以临时调整“中译日/日译中”的数量，然后点击“按数量重新生成”。
 
 每次生成会安排难度梯度：中译日内部会从较少语法逐渐增加到多语法组合，日译中内部也会单独形成同样的梯度。`JAPANESE_AGENT_MAX_GRAMMAR_PER_EXERCISE` 可以控制单题最多组合几个语法。
+
+窗口版启动时可以选择两种生成模式：
+
+- 按语法复习情况生成：自动选择未复习或今日到期的语法，不需要手动指定题目数量。`JAPANESE_AGENT_REVIEW_MODE_EXERCISE_LIMIT` 可以限制这个模式每天最多生成多少道题，超出当天容量的待复习语法会继续标记为到期。
+- 随机抽选语法：使用窗口里指定的中译日/日译中数量随机抽选语法。
 
 ## 语法复习
 

@@ -106,7 +106,7 @@ Anki 已学词汇：
 {words}
 """
         raw = self._complete_json(user_prompt)
-        return parse_exercise_json(raw, date, fallback_titles)
+        return parse_exercise_json(raw, date, fallback_titles, groups)
 
     def grade_answer(self, exercise: dict[str, Any], answer: str) -> dict[str, Any]:
         user_prompt = f"""请批改学习者的答案。
